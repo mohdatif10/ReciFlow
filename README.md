@@ -1,6 +1,6 @@
 # ReciFlow
 
-ReciFlow is a Python-based reciation app that dynamically tracks Quran (or for that matter, any database) verse recitation.
+ReciFlow is a Python-based recitation app that dynamically tracks Quran (or for that matter, any database) verse recitation.
 
 The benefits ReciFlow provide:
 
@@ -8,4 +8,4 @@ The benefits ReciFlow provide:
 
 2. Course-correction upon recognizing mistakes
   
-3. Display of succeeding verses to avoid occurece of recitation errors
+3. Display of succeeding verses to avoid occurence of recitation errors
