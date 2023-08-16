@@ -3,58 +3,25 @@ import Levenshtein
 import pyarabic.araby as araby
 from bidi.algorithm import get_display
 import speech_recognition as sr
-import pyaudio
-import wave
+import tkinter as tk
+from tkinter import scrolledtext
 import re
 from speech_recognition import WaitTimeoutError
-import threading
-import queue
 
-OUTPUT_FILENAME = "output.wav"  # Output file name
-# Create a lock and a queue for handling recognized text
-recognized_text_lock = threading.Lock()
-recognized_text_queue = queue.Queue()
+# For teleprompter
+text_area = None
+root = tk.Tk()
+root.title("Teleprompter")
+text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, font=("Helvetica", 14))
+text_area.pack(expand=True, fill="both")
 
-def record_audio(duration):
-    CHUNK = 1024  # Number of frames per buffer
-    FORMAT = pyaudio.paInt16  # Audio format (16-bit PCM)
-    CHANNELS = 1  # Number of audio channels (1 for mono, 2 for stereo)
-    RATE = 44100  # Sample rate (samples per second)
-
-    p = pyaudio.PyAudio()
-
-    # Open audio stream
-    stream = p.open(format=FORMAT,
-                    channels=CHANNELS,
-                    rate=RATE,
-                    input=True,
-                    frames_per_buffer=CHUNK)
-
-    print("Recording...")
-
-    frames = []
-
-    # Capture audio data in chunks and store in frames
-    for _ in range(0, int(RATE / CHUNK * duration)):
-        data = stream.read(CHUNK)
-        frames.append(data)
-
-    print("Recording finished.")
-
-    # Close and terminate the audio stream
-    stream.stop_stream()
-    stream.close()
-
-    p.terminate()
-
-    # Save recorded audio to a WAV file
-    with wave.open(OUTPUT_FILENAME, "wb") as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(p.get_sample_size(FORMAT))
-        wf.setframerate(RATE)
-        wf.writeframes(b"".join(frames))
-
-    print(f"Audio saved as {OUTPUT_FILENAME}")
+# For Quran db
+db_path = "c:/Users/mohda/Desktop/UW/Spring 2023/ReciFlow/your_database.db"
+conn = sqlite3.connect(db_path)
+cursor = conn.cursor()
+cursor.execute("SELECT Chapter, Verse, Text FROM verses")
+rows = cursor.fetchall()
+conn.close()
 
 def remove_diacritics(text):
     return araby.strip_harakat(text)
@@ -144,95 +111,97 @@ def match_verse(recognized_text, verses):
     return best_verse_info, highest_similarity
 
 
-def run_transcription(recognizer, source, transcription_done_event):
-    print("Transcription thread started.")
-    silence_timeout = 3  # Seconds of silence to end transcription
-    silence_duration = 0  # Current duration of silence
+def run_transcription(recognizer, source):
+    print("Recite...")
 
-    while not transcription_done_event.is_set():
-        audio = recognizer.listen(source, timeout=5)  # Listen for 5 second at a time
-        try:
-            transcription = recognizer.recognize_google(audio, language="ar-SA")
-            if transcription:
-                with recognized_text_lock:
-                    recognized_text_queue.put(transcription)  # Put recognized text into the queue
-                print("Transcription in run_trasncription", transcription)
-                silence_duration = 0  # Reset silence duration if there's audio
-        except sr.UnknownValueError:
-            silence_duration += 1
-            if silence_duration >= silence_timeout:
-                break  # End transcription if silence threshold is reached
-        except sr.RequestError as e:
-            print("Could not request results; {0}".format(e))
-            silence_duration = 0
-        except sr.WaitTimeoutError:
-                    print("Timeout reached. Ending transcription.")
-                    break  # Break the loop on timeout
-                
+    with sr.Microphone() as source:
+
+        while True:
+            try:
+                audio = recognizer.listen(source, timeout=1)  # 1 seconds timeout
+                transcription = recognizer.recognize_google(audio, language="ar-SA")
+                if transcription:
+                    return transcription
+            except sr.UnknownValueError:
+                transcription="UV ERROR"
+                pass  # Continue listening if no speech is detected
+            except WaitTimeoutError:
+                transcription="TIME ERROR"
+                print()
+                break  # Break the loop on timeout
+
     return transcription
 
 
-def continue_recitation_match(next_verse_text, expected_verse_text):
-    next_verse_stripped = remove_diacritics(next_verse_text)
-    expected_verse_stripped = remove_diacritics(expected_verse_text)
+def update_teleprompter(current_verse, remaining_verses):
+    global text_area  # Declare text_area as a global variable
     
-    similarity = 1 - Levenshtein.distance(next_verse_stripped, expected_verse_stripped) / max(len(next_verse_stripped), len(expected_verse_stripped))
-    return similarity >= 0.5
+    text_area.delete("1.0", tk.END)
+    current_verse += 1
+    print("current_verse:", current_verse)
+
+    arabic_font = ("Arial", 16)  # Replace with an Arabic-supporting font and appropriate size
+
+    for index, (verse_number, verse_text) in enumerate(remaining_verses):
+        if verse_number == current_verse:  # Check if the current verse matches the recognized verse
+            text_area.insert(tk.END, f"Verse {verse_number}: {verse_text}\n\n", "red_larger")  # Apply red and larger style
+        else:
+            text_area.insert(tk.END, f"Verse {verse_number}: {verse_text}\n\n", "normal_arabic")  # Use the Arabic font style
+    
+    text_area.tag_configure("red_larger", font=("Helvetica", 20, "bold"), foreground="red")  # Define the red and larger style
+    text_area.tag_configure("normal_arabic", font=arabic_font)  # Define the Arabic font style
+    text_area.yview_moveto(1)  # Automatically scroll down
+    text_area.update()
+
+
+
+
 
 
 
 def main():
-    initial_record_duration = 6
-    extended_record_duration = 10
+    # Start the transcription thread for live transcription
+    transcription_recognizer = sr.Recognizer()
+
     similarity_threshold = 0.333
     min_recognized_text_length = 10
-    extended_recording_done = False
 
     while True:
-        record_audio_duration = extended_record_duration if extended_recording_done else initial_record_duration
-        record_audio(record_audio_duration)
-        audio_path = OUTPUT_FILENAME
 
-        try:
-            recognized_text = recognize_arabic_speech(audio_path)
-            recognized_text = remove_bismillah(recognized_text)
+        with sr.Microphone() as transcription_source:
 
-            if len(recognized_text) < min_recognized_text_length:
-                print("Recognized text length is less than {}, continuing recording...".format(min_recognized_text_length))
-                extended_recording_done = True
+            recognized_text = run_transcription(transcription_recognizer, transcription_source)
+            
+            if recognized_text == "UV ERROR":  # Handling recognition error in the beginning
+                print("Audio recognition error")
+                print()
                 continue
 
-            db_path = "c:/Users/mohda/Desktop/UW/Spring 2023/ReciFlow/your_database.db"
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT Chapter, Verse, Text FROM verses")
-            rows = cursor.fetchall()
-            conn.close()
-
-            best_verse_info, highest_similarity = match_verse(recognized_text, rows)
-            
-            if highest_similarity < similarity_threshold:
-                if not extended_recording_done:
-                    print("Similarity below threshold, extending recording...")
-                    extended_recording_done = True
-                    continue
-                else:
-                    print("Extended recording already done, stopping.")
-                    break
-
-            if need_to_repeat == True:
-                print("Found similar verses, extending recording...")
-                extended_recording_done = True
-                
-            else:
+            elif recognized_text == "TIME ERROR":  # Handling recognition error in the beginning
                 break
-            
-        except sr.UnknownValueError:
-            if not extended_recording_done:
-                print("Speech recognition failed for the first {} seconds. Extending recording...".format(record_audio_duration))
-                extended_recording_done = True
-            else:
-                print("Extended recording already done, stopping.")
+
+            recognized_text = remove_bismillah(recognized_text)
+
+            try:
+                if len(recognized_text) < min_recognized_text_length:
+                    print("Recognized text length is less than {}, continuing recording...".format(min_recognized_text_length))
+                    continue
+
+                best_verse_info, highest_similarity = match_verse(recognized_text, rows)
+                
+                if highest_similarity < similarity_threshold:
+                    print("Similarity below threshold, extending recording...")
+                    continue
+
+                if need_to_repeat == True:
+                    print("Found similar verses, extending recording...")
+                    continue
+                    
+                else:
+                    break
+                
+            except:
+                print("Error in recording initial verse.")
                 break
         
     if isinstance(best_verse_info, tuple):
@@ -240,65 +209,60 @@ def main():
     else:
         best_chapter, best_verse = best_verse_info, None
     
+    recognized_verse_number = best_verse_info[-1]  # Get the recognized verse number from best_verse_info
+
     if best_chapter and best_verse:
         remaining_verses = [(verse[1], verse[2]) for verse in rows if verse[0] == best_chapter and verse[1] >= best_verse]
     else:
         remaining_verses = []
 
-    remaining_verses=remaining_verses[1:]
 
 
 
-    # Now for post-match recitation
-   
+    # POST MATCHING
+
+    match_threshold = 0.5  # Matching similarity threshold
+    i=0
+    
+    print("remaining_verses ", remaining_verses)
     print()
-    for verse_number, verse_text in remaining_verses:
-        print(f"Chapter {best_chapter}, Verse {verse_number}: {verse_text}")
+    print("remaining_verses[-1][0]", remaining_verses[-1][0])
 
-    print()
+    while recognized_verse_number < remaining_verses[-1][0]:
+        print("recognized_verse_number", recognized_verse_number)
+        verse_number, verse_text = remaining_verses[i]
+        i+=1
+        print("HERE 1")
 
-    for verse_number, verse_text in remaining_verses:
-        print(f"Processing Verse {verse_number}: {verse_text}")
-
-        # Start the transcription thread for live transcription
-        transcription_done_event = threading.Event()
-        transcription_recognizer = sr.Recognizer()
-
-        with sr.Microphone() as transcription_source:
-            transcription_thread = threading.Thread(target=run_transcription, args=(transcription_recognizer, transcription_source, transcription_done_event))
-            transcription_thread.start()
-
-            print("Started recording")
-
-            match_threshold = 0.5  # Matching similarity threshold
+        for verse_number, verse_text in remaining_verses:
+            update_teleprompter(recognized_verse_number, remaining_verses)
+            root.update()  # Update the Tkinter window to show the verse
+            print("HERE 2")
 
             while True:
-                try:
-                    # Reuse the run_transcription function here
-                    transcription=run_transcription(transcription_recognizer, transcription_source, transcription_done_event)
+                recognized_text = run_transcription(transcription_recognizer, transcription_source)
 
-                    verse_stripped = remove_diacritics(verse_text)
-                    similarity = 1 - Levenshtein.distance(remove_diacritics(transcription), verse_stripped) / max(len(transcription), len(verse_stripped))
+                if "UV ERROR" in recognized_text or "TIME ERROR" in recognized_text:
+                    print("Audio recognition error")
+                    print()
+                    continue
+
+                best_verse_info, highest_similarity = match_verse(recognized_text, rows)
                     
-                    print("Similarity of transcription ", similarity)
+                if highest_similarity < match_threshold:
+                    print("Similarity below threshold, extending recording...")
+                    continue
+                
+                recognized_verse_number += 1  # Move to the next verse
 
-                    if similarity >= match_threshold:
-                        print("Verse recognized correctly.")
-                        break
-                    else:
-                        print("Wrong recitation. Please try again.")
+                break
+            
 
-                except sr.UnknownValueError:
-                    pass  # Continue listening if no speech is detected
-                except sr.WaitTimeoutError:
-                    print("Timeout reached. Ending transcription.")
-                    break  # Break the loop on timeout
-
-            print("Transcription thread stopping.")
-            transcription_done_event.set()  # Signal the transcription thread to stop
-            transcription_thread.join()  # Wait for the transcription thread to finish
-
+    root.mainloop()
     print("All remaining verses have been processed.")
+    
+root.destroy()  # Close the teleprompter window
+
 
 if __name__ == "__main__":
     main()
