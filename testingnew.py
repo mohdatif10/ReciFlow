@@ -1,5 +1,4 @@
 import sqlite3
-import Levenshtein
 import pyarabic.araby as araby
 from bidi.algorithm import get_display
 import speech_recognition as sr
@@ -7,13 +6,9 @@ import tkinter as tk
 from tkinter import scrolledtext
 import re
 from speech_recognition import WaitTimeoutError
+from fuzzywuzzy import fuzz
 
-# For teleprompter
-text_area = None
-root = tk.Tk()
-root.title("Teleprompter")
-text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, font=("Helvetica", 14))
-text_area.pack(expand=True, fill="both")
+iteration_ct = 0 # 2 rakats => 4 loud recitations for each salat
 
 # For Quran db
 db_path = "c:/Users/mohda/Desktop/UW/Spring 2023/ReciFlow/your_database.db"
@@ -23,156 +18,159 @@ cursor.execute("SELECT Chapter, Verse, Text FROM verses")
 rows = cursor.fetchall()
 conn.close()
 
+
 def remove_diacritics(text):
     return araby.strip_harakat(text)
 
-def remove_bismillah(text):
-    bismillah_variations = [
-        "بِسۡمِ ٱللَّهِ ٱلرَّحۡمَٰنِ ٱلرَّحِيمِ",
-        "بسم الله الرحمن الرحيم"
-    ]
-    alhamdullillah_pattern = r"(ٱلحمد للّه ربّ ٱلعـٰلمين|ٱلْحَمْدُ لِلَّهِ رَبِّ ٱلْعَـٰلَمِينَ|الحمد لله رب العالمين)"
-    
-    for variation in bismillah_variations:
-        if text.startswith(variation):
-            after_bismillah = text[len(variation):].strip()
-            alhamdullillah_match = re.search(alhamdullillah_pattern, after_bismillah)
-            
-            if not alhamdullillah_match:
-                return after_bismillah
-    
-    text = araby.strip_harakat(text)  # Remove diacritics
-    return text
-
-def recognize_arabic_speech(audio_path):
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(audio_path) as source:
-        try:
-            audio = recognizer.record(source, duration=10)  # Record for 10 seconds initially
-            recognized_text = recognizer.recognize_google(audio, language="ar-SA")
-        except sr.UnknownValueError:
-            print("Speech recognition failed for the first 10 seconds. Extending recording...")
-            audio = recognizer.record(source, duration=30)  # Extend recording to 30 seconds
-            try:
-                recognized_text = recognizer.recognize_google(audio, language="ar-SA")
-            except sr.UnknownValueError:
-                recognized_text = ""  # Set recognized_text to empty if recognition still fails
-            
-    return recognized_text
 
 def match_verse(recognized_text, verses):
-    global need_to_repeat 
-    recognized_text = remove_bismillah(recognized_text)
     recognized_stripped = remove_diacritics(recognized_text)
-    print("recognized_stripped:", recognized_stripped)
-    
+
     best_match = None
     highest_similarity = 0
     best_verse_info = None  # Tuple (chapter, verse)
 
-    need_to_repeat = False  # Initialize the variable before checking similarities
-    old_similarity=0
-
+    need_to_repeat = False
+    old_similarity = 0
 
     for verse in verses:
-        chapter = verse[0]
-        verse_number = verse[1]
-        verse_text = verse[2]
+        chapter, verse_number, verse_text = verse
         verse_stripped = remove_diacritics(verse_text)
-        similarity = 1 - Levenshtein.distance(recognized_stripped, verse_stripped) / max(len(recognized_stripped), len(verse_stripped))
+        similarity = fuzz.ratio(recognized_stripped, verse_stripped) / 100.0
 
         if similarity > highest_similarity:
             best_match = verse_text
             highest_similarity = similarity
             best_verse_info = (chapter, verse_number)
-            
-        if similarity==highest_similarity:
-            if highest_similarity>old_similarity:
-                old_similarity=highest_similarity
-                need_to_repeat=False
-            else:
-                need_to_repeat=True
 
-    if highest_similarity < 0.5:
+        if similarity == highest_similarity:
+            if highest_similarity > old_similarity:
+                old_similarity = highest_similarity
+                need_to_repeat = False
+            else:
+                need_to_repeat = True
+
+    if highest_similarity < 0.43:
         for i in range(len(verses) - 1):
             concatenated_text = verses[i][2] + " " + verses[i + 1][2]
             concatenated_stripped = remove_diacritics(concatenated_text)
-            similarity = 1 - Levenshtein.distance(recognized_stripped, concatenated_stripped) / max(len(recognized_stripped), len(concatenated_stripped))
-            
+            similarity = fuzz.ratio(recognized_stripped, concatenated_stripped) / 100.0
+
             if similarity > highest_similarity:
                 best_match = concatenated_text
                 highest_similarity = similarity
                 best_verse_info = (verses[i][0], verses[i][1], verses[i + 1][1])
 
-    print("highest_similarity:", highest_similarity)
-    print("matched_verse:", remove_diacritics(best_match))
-    print("best_verse_info", best_verse_info)
-    
-    return best_verse_info, highest_similarity
+    print("best_verse_info, highest_similarity" , best_verse_info, highest_similarity)
+
+    return best_verse_info, highest_similarity, need_to_repeat
 
 
-def run_transcription(recognizer, source):
+def run_transcription(recognizer, source, remaining_verses=[], next_verse=0, tmo=35, pth=1.8):
+    print()
     print("Recite...")
 
+    if next_verse != 0:
+        for chapter, verse_number, verse_text in remaining_verses:
+            if verse_number == next_verse:
+                pth = len(verse_text.split()) * 0.45 
+                break
+    
     with sr.Microphone() as source:
 
         while True:
             try:
-                audio = recognizer.listen(source, timeout=1)  # 1 seconds timeout
+                audio = recognizer.listen(source, timeout=tmo, phrase_time_limit=pth)
                 transcription = recognizer.recognize_google(audio, language="ar-SA")
                 if transcription:
                     return transcription
             except sr.UnknownValueError:
-                transcription="UV ERROR"
+                transcription = "UV ERROR"
                 pass  # Continue listening if no speech is detected
             except WaitTimeoutError:
-                transcription="TIME ERROR"
+                transcription = "TIME ERROR"
                 print()
                 break  # Break the loop on timeout
 
     return transcription
 
 
-def update_teleprompter(current_verse, remaining_verses):
-    global text_area  # Declare text_area as a global variable
-    
+def update_teleprompter(root, text_area, current_verse, remaining_verses, attempts_mismatch):
+    arabic_font = ("Amiri", 50)
+
+    # Find and remove the current verse from remaining_verses
+    verse_to_remove = None
+    for index, (chapter, verse_number, _) in enumerate(remaining_verses):
+        if verse_number == current_verse:
+            verse_to_remove = index
+            break
+
+    if verse_to_remove is not None:
+        remaining_verses.pop(0)
+
     text_area.delete("1.0", tk.END)
     current_verse += 1
     print("current_verse:", current_verse)
 
-    arabic_font = ("Arial", 16)  # Replace with an Arabic-supporting font and appropriate size
-
-    for index, (verse_number, verse_text) in enumerate(remaining_verses):
-        if verse_number == current_verse:  # Check if the current verse matches the recognized verse
-            text_area.insert(tk.END, f"Verse {verse_number}: {verse_text}\n\n", "red_larger")  # Apply red and larger style
+    for index, (chapter, verse_number, verse_text) in enumerate(remaining_verses):
+        if verse_number == current_verse:
+            if attempts_mismatch == 0:
+                # Current verse, no mismatch
+                text_area.insert(tk.END, f"{chapter}, {verse_number}: {verse_text}\n\n", "red_larger")
+            elif attempts_mismatch == 1:
+                # Current verse, one mismatch
+                text_area.insert(tk.END, f"{chapter}, {verse_number}: {verse_text}\n\n", "blue_larger")
         else:
-            text_area.insert(tk.END, f"Verse {verse_number}: {verse_text}\n\n", "normal_arabic")  # Use the Arabic font style
+            # Not the current verse
+            text_area.insert(tk.END, f"{chapter}, {verse_number}: {verse_text}\n\n", "normal_arabic")
+
+    # Configure tags for font styles and colors
+    text_area.tag_configure("red_larger", font=("Amiri", 80, "bold"), foreground="red")
+    text_area.tag_configure("blue_larger", font=("Amiri", 95, "bold"), foreground="blue")
+    text_area.tag_configure("normal_arabic", font=arabic_font)
+
+    # Update the Tkinter window and the scrollbar
+    text_area.update_idletasks()
+    root.update()
+   
     
-    text_area.tag_configure("red_larger", font=("Helvetica", 20, "bold"), foreground="red")  # Define the red and larger style
-    text_area.tag_configure("normal_arabic", font=arabic_font)  # Define the Arabic font style
-    text_area.yview_moveto(1)  # Automatically scroll down
-    text_area.update()
 
 
-
-
-
-
+#################################################################################################################################################
 
 def main():
-    # Start the transcription thread for live transcription
-    transcription_recognizer = sr.Recognizer()
+    global iteration_ct
 
-    similarity_threshold = 0.333
-    min_recognized_text_length = 10
+    text_area = None
+    root = tk.Tk()
+    root.attributes('-fullscreen', True)
+    root.title("Teleprompter")
+    text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, font=("Amiri", 50))
+    text_area.pack(expand=True, fill="both")
+
+    transcription_recognizer = sr.Recognizer()
+    similarity_threshold = 0.25
+    min_recognized_text_length = 5
 
     while True:
 
         with sr.Microphone() as transcription_source:
 
             recognized_text = run_transcription(transcription_recognizer, transcription_source)
+
+            print("recognized_text , ", recognized_text)
+
+            if re.match(r"^بسم الله الرحمن الرحيم\s*$", recognized_text):
+                print("Recognized بسم الله الرحمن الرحيم. Continue...")
+                continue
+
+            elif re.search(r"(سميع الله لمن حمده|سمى الله لمن حمده|الله اكبر|سمى الله لمن هم)", recognized_text): # امين needs to be reconsidered
+                root.destroy() 
+                iteration_ct+=1
+                print("Detected {}. Prayer action...".format(recognized_text))
+                main()
             
-            if recognized_text == "UV ERROR":  # Handling recognition error in the beginning
+            elif recognized_text == "UV ERROR":  # Handling recognition error in the beginning
                 print("Audio recognition error")
                 print()
                 continue
@@ -180,21 +178,19 @@ def main():
             elif recognized_text == "TIME ERROR":  # Handling recognition error in the beginning
                 break
 
-            recognized_text = remove_bismillah(recognized_text)
-
             try:
                 if len(recognized_text) < min_recognized_text_length:
                     print("Recognized text length is less than {}, continuing recording...".format(min_recognized_text_length))
                     continue
 
-                best_verse_info, highest_similarity = match_verse(recognized_text, rows)
+                best_verse_info, highest_similarity, need_to_repeat = match_verse(recognized_text, rows)
                 
                 if highest_similarity < similarity_threshold:
-                    print("Similarity below threshold, extending recording...")
+                    print("Similarity below threshold, retry...")
                     continue
 
                 if need_to_repeat == True:
-                    print("Found similar verses, extending recording...")
+                    print("Found similar verses, retry...")
                     continue
                     
                 else:
@@ -212,57 +208,78 @@ def main():
     recognized_verse_number = best_verse_info[-1]  # Get the recognized verse number from best_verse_info
 
     if best_chapter and best_verse:
-        remaining_verses = [(verse[1], verse[2]) for verse in rows if verse[0] == best_chapter and verse[1] >= best_verse]
+     remaining_verses = [(verse[0], verse[1], verse[2]) for verse in rows if verse[0] == best_chapter and verse[1] >= best_verse]
     else:
         remaining_verses = []
 
 
-
-
     # POST MATCHING
-
-    match_threshold = 0.5  # Matching similarity threshold
-    i=0
-    
-    print("remaining_verses ", remaining_verses)
+    max_attempts_mismatch = 2  # Maximum number of consecutive mismatched attempts
+    attempts_mismatch=0
+    match_threshold = 0.38 
     print()
-    print("remaining_verses[-1][0]", remaining_verses[-1][0])
 
-    while recognized_verse_number < remaining_verses[-1][0]:
-        print("recognized_verse_number", recognized_verse_number)
-        verse_number, verse_text = remaining_verses[i]
-        i+=1
-        print("HERE 1")
+    while recognized_verse_number < remaining_verses[-1][1]:
+        attempts_mismatch=0
+        print()
+        update_teleprompter(root, text_area, recognized_verse_number, remaining_verses, attempts_mismatch)
 
-        for verse_number, verse_text in remaining_verses:
-            update_teleprompter(recognized_verse_number, remaining_verses)
-            root.update()  # Update the Tkinter window to show the verse
-            print("HERE 2")
+        root.update()  # Update the Tkinter window to show the verse
 
-            while True:
-                recognized_text = run_transcription(transcription_recognizer, transcription_source)
+        while attempts_mismatch<max_attempts_mismatch:
+            update_teleprompter(root, text_area, recognized_verse_number, remaining_verses, attempts_mismatch)
+            recognized_text = run_transcription(transcription_recognizer, transcription_source, remaining_verses, recognized_verse_number+1)
 
-                if "UV ERROR" in recognized_text or "TIME ERROR" in recognized_text:
-                    print("Audio recognition error")
-                    print()
-                    continue
-
-                best_verse_info, highest_similarity = match_verse(recognized_text, rows)
-                    
-                if highest_similarity < match_threshold:
-                    print("Similarity below threshold, extending recording...")
-                    continue
-                
-                recognized_verse_number += 1  # Move to the next verse
-
-                break
+            if recognized_text.startswith("بسم الله الرحمن الرحيم"):
+                print("Recognized بسم الله الرحمن الرحيم. Continue...")
+                continue
             
+            elif re.search(r"(الله اكبر)", recognized_text):
+                root.destroy()
+                iteration_ct+=1
+                print("Detected {}. Prayer action...".format(recognized_text))
+                main()
+
+            elif "UV ERROR" in recognized_text or "TIME ERROR" in recognized_text:
+                print("Audio recognition error")
+                print()
+                continue
+
+            best_verse_info, highest_similarity, need_to_repeat = match_verse(recognized_text, remaining_verses)
+            versenum_realized=best_verse_info[-1]
+            
+            if versenum_realized:
+                if len(best_verse_info)==2:
+                    if(versenum_realized!=recognized_verse_number+1):
+                        attempts_mismatch+=1
+                        print("Incorrect match, retry...")
+                        continue
+                elif len(best_verse_info)==3:
+                    if(versenum_realized!=recognized_verse_number):
+                        attempts_mismatch+=1
+                        print("Incorrect match, retry...")
+                        continue
+
+            if highest_similarity < match_threshold:
+                attempts_mismatch+=1
+                print("Similarity below threshold, retry...")
+                continue
+            
+            break
+
+        recognized_verse_number += 1  # Move to the next verse
+        
+
+    root.destroy()  # Close the teleprompter window
 
     root.mainloop()
+    print()
     print("All remaining verses have been processed.")
-    
-root.destroy()  # Close the teleprompter window
+    iteration_ct+=1
 
+    print("iteration_ct", iteration_ct)
+    if iteration_ct < 12: # 12 different prayer actions
+        main()
 
 if __name__ == "__main__":
     main()
